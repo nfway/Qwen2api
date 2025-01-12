@@ -88,21 +88,15 @@ async function processLine(line: string, writer: WritableStreamDefaultWriter<Uin
             }
           }]
         };
-        await writer.write(encoder.encode(`data: ${JSON.stringify(newData)}
-
-`));
+        await writer.write(encoder.encode(`data: ${JSON.stringify(newData)}\n\n`));
       }
       return currentContent;
     } else {
-      await writer.write(encoder.encode(`data: ${JSON.stringify(data)}
-
-`));
+      await writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       return previousContent;
     }
   } catch (e) {
-    await writer.write(encoder.encode(`${line}
-
-`));
+    await writer.write(encoder.encode(`${line}\n\n`));
     return previousContent;
   }
 }
@@ -117,25 +111,21 @@ async function handleStream(reader: ReadableStreamDefaultReader<Uint8Array>, wri
       if (done) {
         clearTimeout(timeout);
         if (buffer) {
-          const lines = buffer.split('
-');
+          const lines = buffer.split('\n');
           for (const line of lines) {
             if (line.trim().startsWith('data: ')) {
               await processLine(line, writer, previousContent);
             }
           }
         }
-        await writer.write(encoder.encode('data: [DONE]
-
-'));
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
         await writer.close();
         break;
       }
 
       buffer += streamDecoder.decode(value);
 
-      const lines = buffer.split('
-');
+      const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
@@ -149,12 +139,8 @@ async function handleStream(reader: ReadableStreamDefaultReader<Uint8Array>, wri
     }
   } catch (error) {
     clearTimeout(timeout);
-    await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}
-
-`));
-    await writer.write(encoder.encode('data: [DONE]
-
-'));
+    await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}\n\n`));
+    await writer.write(encoder.encode('data: [DONE]\n\n'));
     await writer.close();
   }
 }
@@ -245,23 +231,15 @@ async function handleRequest(request: Request): Promise<Response> {
       let previousContent = '';
 
       const timeout = setTimeout(() => {
-        writer.write(encoder.encode('data: {"error":true,"message":"Response timeout"}
-
-'));
-        writer.write(encoder.encode('data: [DONE]
-
-'));
+        writer.write(encoder.encode('data: {"error":true,"message":"Response timeout"}\n\n'));
+        writer.write(encoder.encode('data: [DONE]\n\n'));
         writer.close();
       }, 60000);
 
       handleStream(reader, writer, previousContent, timeout).catch(async (error) => {
         clearTimeout(timeout);
-        await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}
-
-`));
-        await writer.write(encoder.encode('data: [DONE]
-
-'));
+        await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}\n\n`));
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
         await writer.close();
       });
 
