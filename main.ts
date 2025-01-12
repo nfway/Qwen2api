@@ -69,10 +69,12 @@ async function processLine(line: string, writer: WritableStreamDefaultWriter<Uin
   try {
     const data = JSON.parse(line.slice(6));
     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
-      const currentContent = data.choices[0].delta.content;
+      const currentContent: string = data.choices[0].delta.content;
       let newContent = currentContent;
-      if (currentContent.startsWith(previousContent) && previousContent.length > 0) {
+      if (currentContent.startsWith(previousContent)) {
         newContent = currentContent.slice(previousContent.length);
+      } else {
+        return previousContent; // 如果发生Unicode乱码，直接跳过此轮
       }
 
       if (newContent) { // 仅当有新内容时才发送
@@ -86,15 +88,21 @@ async function processLine(line: string, writer: WritableStreamDefaultWriter<Uin
             }
           }]
         };
-        await writer.write(encoder.encode(`data: ${JSON.stringify(newData)}\n\n`));
+        await writer.write(encoder.encode(`data: ${JSON.stringify(newData)}
+
+`));
       }
       return currentContent;
     } else {
-      await writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+      await writer.write(encoder.encode(`data: ${JSON.stringify(data)}
+
+`));
       return previousContent;
     }
   } catch (e) {
-    await writer.write(encoder.encode(`${line}\n\n`));
+    await writer.write(encoder.encode(`${line}
+
+`));
     return previousContent;
   }
 }
@@ -109,21 +117,25 @@ async function handleStream(reader: ReadableStreamDefaultReader<Uint8Array>, wri
       if (done) {
         clearTimeout(timeout);
         if (buffer) {
-          const lines = buffer.split('\n');
+          const lines = buffer.split('
+');
           for (const line of lines) {
             if (line.trim().startsWith('data: ')) {
               await processLine(line, writer, previousContent);
             }
           }
         }
-        await writer.write(encoder.encode('data: [DONE]\n\n'));
+        await writer.write(encoder.encode('data: [DONE]
+
+'));
         await writer.close();
         break;
       }
 
       buffer += streamDecoder.decode(value);
 
-      const lines = buffer.split('\n');
+      const lines = buffer.split('
+');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
@@ -137,8 +149,12 @@ async function handleStream(reader: ReadableStreamDefaultReader<Uint8Array>, wri
     }
   } catch (error) {
     clearTimeout(timeout);
-    await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}\n\n`));
-    await writer.write(encoder.encode('data: [DONE]\n\n'));
+    await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}
+
+`));
+    await writer.write(encoder.encode('data: [DONE]
+
+'));
     await writer.close();
   }
 }
@@ -229,15 +245,23 @@ async function handleRequest(request: Request): Promise<Response> {
       let previousContent = '';
 
       const timeout = setTimeout(() => {
-        writer.write(encoder.encode('data: {"error":true,"message":"Response timeout"}\n\n'));
-        writer.write(encoder.encode('data: [DONE]\n\n'));
+        writer.write(encoder.encode('data: {"error":true,"message":"Response timeout"}
+
+'));
+        writer.write(encoder.encode('data: [DONE]
+
+'));
         writer.close();
       }, 60000);
 
       handleStream(reader, writer, previousContent, timeout).catch(async (error) => {
         clearTimeout(timeout);
-        await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}\n\n`));
-        await writer.write(encoder.encode('data: [DONE]\n\n'));
+        await writer.write(encoder.encode(`data: {"error":true,"message":"${error.message}"}
+
+`));
+        await writer.write(encoder.encode('data: [DONE]
+
+'));
         await writer.close();
       });
 
