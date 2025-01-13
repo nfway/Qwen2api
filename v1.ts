@@ -171,11 +171,7 @@ async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    if (pathname === "/v1/models") {
+    if (request.method === "GET" && pathname === "/api/models") {
       const authHeader = request.headers.get("Authorization");
       if (!authHeader || !authHeader.startsWith("Bearer ")) {
         return new Response("Unauthorized", { status: 401 });
@@ -217,8 +213,8 @@ async function handleRequest(request: Request): Promise<Response> {
       }
     }
 
-    if (pathname !== "/v1/chat/completions") {
-      return new Response("Not found", { status: 404 });
+    if (request.method !== "POST" || pathname !== "/v1/chat/completions") {
+      return new Response("Method not allowed", { status: 405 });
     }
 
     const authHeader = request.headers.get("Authorization");
