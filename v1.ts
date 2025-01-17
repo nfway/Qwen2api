@@ -1,316 +1,303 @@
-// Qwen API 配置
-const QWEN_API_URL = "https://chat.qwenlm.ai/api/chat/completions";
-const QWEN_MODELS_URL = "https://chat.qwenlm.ai/api/models";
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000; // 1秒
+import { serve } from "https://deno.land/std/http/server.ts";
 
-const encoder = new TextEncoder();
-const streamDecoder = new TextDecoder();
+const QWEN_BASE_URL = "https://chat.qwenlm.ai";
 
-let cachedModels: string | null = null;
-let cachedModelsTimestamp = 0;
-const CACHE_TTL = 60 * 60 * 1000; // 缓存 1 小时
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// 接口定义
+interface MessageContent {
+  type: string;
+  text?: string;
+  image?: string;
+  image_url?: {
+    url: string;
+  };
 }
 
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
-  retries = MAX_RETRIES,
-): Promise<Response> {
-  let lastError: unknown;
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, options);
+interface Message {
+  role: string;
+  content: MessageContent[] | string;
+}
 
-      if (response.ok) {
-        return response;
-      }
+// 流式响应相关接口
+interface DeltaChoice {
+  delta: {
+    content?: string;
+    role?: string;
+  };
+  index: number;
+  finish_reason: string | null;
+}
 
-      const contentType = response.headers.get("content-type") || "";
-      if (response.status >= 500 || contentType.includes("text/html")) {
-        const responseClone = response.clone();
-        const responseText = await responseClone.text();
-        lastError = {
-          status: response.status,
-          contentType,
-          responseText: responseText.slice(0, 1000),
-          headers: Object.fromEntries(response.headers.entries()),
-        };
+interface StreamResponse {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: DeltaChoice[];
+}
 
-        if (i < retries - 1) {
-          await sleep(RETRY_DELAY * (i + 1));
-          continue;
-        }
-      } else {
-        // 对于非 5xx 错误，不再重试
-        lastError = {
-          status: response.status,
-          headers: Object.fromEntries(response.headers.entries()),
-        };
-        break;
-      }
-    } catch (error) {
-      lastError = error;
-      if (i < retries - 1) {
-        await sleep(RETRY_DELAY * (i + 1));
-        continue;
-      }
-    }
+/**
+ * 获取两个字符串之间的增量内容
+ */
+function getIncrementalContent(previous: string, current: string): string {
+  let i = 0;
+  while (i < previous.length && i < current.length && previous[i] === current[i]) {
+    i++;
   }
-
-  throw new Error(JSON.stringify({
-    error: true,
-    message: "All retry attempts failed",
-    lastError,
-    retries,
-  }));
+  return current.slice(i);
 }
 
-async function processLine(
-  line: string,
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  previousContent: string,
-): Promise<string> {
-  try {
-    const data = JSON.parse(line.slice(6));
-    if (
-      data.choices && data.choices[0] && data.choices[0].delta &&
-      data.choices[0].delta.content
-    ) {
-      const currentContent: string = data.choices[0].delta.content;
-      let newContent = currentContent;
-
-      if (currentContent.startsWith(previousContent) && previousContent.length > 0) {
-        newContent = currentContent.slice(previousContent.length);
-      }
-
-      if (newContent) { // 仅当有新内容时才发送
-        const newData = {
-          ...data,
-          choices: [{
-            ...data.choices[0],
-            delta: {
-              ...data.choices[0].delta,
-              content: newContent,
-            },
-          }],
-        };
-        await writer.write(
-          encoder.encode(`data: ${JSON.stringify(newData)}\n\n`),
-        );
-      }
-      return currentContent;
-    } else {
-      await writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-      return previousContent;
-    }
-  } catch {
-    await writer.write(encoder.encode(`${line}\n\n`));
-    return previousContent;
-  }
-}
-
-async function handleStream(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  previousContent: string,
-  timeout: number,
-) {
+/**
+ * 处理流式响应的核心函数
+ */
+async function streamResponse(response: Response) {
+  // 获取响应体的读取器
+  const reader = response.body!.getReader();
+  // 创建文本编码器和解码器
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  
+  // 用于存储未处理完的数据片段
   let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) {
-        clearTimeout(timeout);
-        if (buffer) {
+  // 用于记录上一次的完整内容，用于计算增量
+  let previousContent = "";
+  
+  // 创建可读流
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        while (true) {
+          // 读取数据块
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          // 将二进制数据解码为文本
+          buffer += decoder.decode(value, { stream: true });
+          // 按换行符分割数据
           const lines = buffer.split("\n");
+          // 保存最后一个可能不完整的行
+          buffer = lines.pop() || "";
+          
           for (const line of lines) {
-            if (line.trim().startsWith("data: ")) {
-              await processLine(line, writer, previousContent);
+            // 跳过空行
+            if (line.trim() === "") continue;
+            // 跳过非数据行
+            if (!line.startsWith("data: ")) continue;
+            
+            // 提取数据部分
+            const data = line.slice(6);
+            // 处理流结束标记
+            if (data === "[DONE]") {
+              controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+              continue;
+            }
+            
+            try {
+              // 解析 JSON 数据
+              const parsed = JSON.parse(data) as StreamResponse;
+              const choice = parsed.choices[0];
+              
+              if (choice?.delta?.content) {
+                // 处理内容更新
+                const currentContent = choice.delta.content;
+                // 计算真正的增量内容
+                const incrementalContent = getIncrementalContent(previousContent, currentContent);
+                
+                if (incrementalContent) {
+                  // 构造新的输出对象，只包含增量内容
+                  const newOutput: StreamResponse = {
+                    ...parsed,
+                    choices: [{
+                      ...choice,
+                      delta: { content: incrementalContent }
+                    }]
+                  };
+                  // 将增量内容编码并发送
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(newOutput)}\n\n`));
+                  // 更新前一次的内容
+                  previousContent = currentContent;
+                }
+              } else if (choice?.delta?.role) {
+                // 对于角色信息，直接转发不需要处理增量
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
+              }
+            } catch (e) {
+              console.error("Failed to parse JSON:", e);
             }
           }
         }
-        await writer.write(encoder.encode("data: [DONE]\n\n"));
-        await writer.close();
-        break;
-      }
-
-      const valueText = streamDecoder.decode(value, { stream: true });
-
-      buffer += valueText;
-
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (line.trim().startsWith("data: ")) {
-          const result = await processLine(line, writer, previousContent);
-          if (result) {
-            previousContent = result;
+        
+        // 处理缓冲区中可能剩余的最后一块数据
+        if (buffer) {
+          try {
+            const data = buffer.replace(/^data: /, "");
+            if (data !== "[DONE]") {
+              // 解析并处理最后的数据块
+              const parsed = JSON.parse(data) as StreamResponse;
+              const choice = parsed.choices[0];
+              
+              if (choice?.delta?.content) {
+                const currentContent = choice.delta.content;
+                const incrementalContent = getIncrementalContent(previousContent, currentContent);
+                
+                if (incrementalContent) {
+                  const newOutput: StreamResponse = {
+                    ...parsed,
+                    choices: [{
+                      ...choice,
+                      delta: { content: incrementalContent }
+                    }]
+                  };
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(newOutput)}\n\n`));
+                }
+              }
+            }
+          } catch (e) {
+            console.error("Failed to parse remaining buffer:", e);
           }
         }
+        
+        // 关闭控制器
+        controller.close();
+      } catch (e) {
+        // 发生错误时通知控制器
+        controller.error(e);
       }
-    }
-  } catch (error) {
-    clearTimeout(timeout);
-    await writer.write(
-      encoder.encode(`data: {"error":true,"message":"${error.message}"}\n\n`),
-    );
-    await writer.write(encoder.encode("data: [DONE]\n\n"));
-    await writer.close();
-  }
+    },
+  });
+
+  // 返回新的流式响应，设置适当的响应头
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",  // 指定为服务器发送事件流
+      "Cache-Control": "no-cache",          // 禁用缓存
+      "Connection": "keep-alive",           // 保持连接
+    },
+  });
 }
 
-async function handleRequest(request: Request): Promise<Response> {
-  try {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
+/**
+ * 将base64图片上传到API
+ */
+async function uploadImage(base64Image: string, headers: Headers): Promise<string> {
+  // 从base64字符串中提取实际的数据部分
+  const base64Data = base64Image.split(',')[1] || base64Image;
+  
+  // 将base64解码为二进制数据
+  const binaryData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+  
+  // 创建文件上传请求
+  const formData = new FormData();
+  const blob = new Blob([binaryData]);
+  formData.append('file', blob, 'image.png');
+  
+  // 创建新的headers，复制认证相关的header
+  const uploadHeaders = new Headers();
+  const authHeader = headers.get('Authorization');
+  if (authHeader) {
+    uploadHeaders.set('Authorization', authHeader);
+  }
+  
+  const uploadResponse = await fetch(`${QWEN_BASE_URL}/api/v1/files/`, {
+    method: 'POST',
+    headers: uploadHeaders,
+    body: formData,
+  });
+  
+  if (!uploadResponse.ok) {
+    throw new Error(`Failed to upload image: ${uploadResponse.statusText}`);
+  }
+  
+  const result = await uploadResponse.json();
+  return result.id;
+}
 
-    if (request.method === "GET" && pathname === "/api/models") {
-      const authHeader = request.headers.get("Authorization");
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return new Response("Unauthorized", { status: 401 });
+/**
+ * 转换消息格式，处理图片上传
+ */
+async function convertMessages(messages: Message[], headers: Headers): Promise<Message[]> {
+  const convertedMessages: Message[] = [];
+  
+  for (const message of messages) {
+    const convertedMessage: Message = { ...message };
+    
+    if (Array.isArray(message.content)) {
+      const convertedContent: MessageContent[] = [];
+      
+      for (const content of message.content) {
+        if (content.type === 'image_url' && content.image_url?.url?.startsWith('data:image')) {
+          // 上传图片并获取文件ID
+          const fileId = await uploadImage(content.image_url.url, headers);
+          convertedContent.push({
+            type: 'image',
+            image: fileId
+          });
+        } else {
+          convertedContent.push(content);
+        }
       }
+      
+      convertedMessage.content = convertedContent;
+    }
+    
+    convertedMessages.push(convertedMessage);
+  }
+  
+  return convertedMessages;
+}
 
-      const now = Date.now();
-      if (cachedModels && now - cachedModelsTimestamp < CACHE_TTL) {
-        return new Response(cachedModels, {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-          },
-        });
-      }
-
+/**
+ * 处理传入请求的主函数
+ */
+async function handleRequest(request: Request) {
+  const url = new URL(request.url);
+  const targetUrl = new URL(url.pathname + url.search, QWEN_BASE_URL);
+  
+  let body;
+  if (request.method !== "GET") {
+    body = await request.json();
+    
+    // 如果是聊天完成请求，且包含消息数组，进行消息转换
+    if (url.pathname === "/api/chat/completions" && Array.isArray(body?.messages)) {
       try {
-        const response = await fetchWithRetry(QWEN_MODELS_URL, {
-          headers: {
-            "Authorization": authHeader,
-          },
-        });
-
-        cachedModels = await response.text();
-        cachedModelsTimestamp = now;
-
-        return new Response(cachedModels, {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-          },
-        });
+        body.messages = await convertMessages(body.messages, request.headers);
       } catch (error) {
-        return new Response(
-          JSON.stringify({ error: true, message: error.message }),
-          { status: 500 },
-        );
+        console.error("Error converting messages:", error);
+        return new Response(JSON.stringify({ error: "Failed to process images" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+  }
+  
+  const requestInit: RequestInit = {
+    method: request.method,
+    headers: new Headers(request.headers),
+  };
+
+  if (body) {
+    requestInit.body = JSON.stringify(body);
+  }
+
+  try {
+    const response = await fetch(targetUrl.toString(), requestInit);
+    
+    if (url.pathname === "/api/chat/completions" && body?.stream === true) {
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("text/event-stream")) {
+        return await streamResponse(response);
       }
     }
 
-    if (request.method !== "POST" || pathname !== "/v1/chat/completions") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    const authHeader = request.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const requestData = await request.json();
-    const { messages, stream = false, model, max_tokens } = requestData;
-
-    if (!model) {
-      return new Response(
-        JSON.stringify({ error: true, message: "Model parameter is required" }),
-        { status: 400 },
-      );
-    }
-
-    const qwenRequest = {
-      model,
-      messages,
-      stream,
-    };
-
-    if (max_tokens !== undefined) {
-      qwenRequest.max_tokens = max_tokens;
-    }
-
-    const qwenResponse = await fetch(QWEN_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": authHeader,
-      },
-      body: JSON.stringify(qwenRequest),
-    });
-
-    if (stream) {
-      const { readable, writable } = new TransformStream<
-        Uint8Array,
-        Uint8Array
-      >();
-      const writer = writable.getWriter();
-      const reader = qwenResponse.body!.getReader();
-
-      const timeout = setTimeout(async () => {
-        try {
-          await writer.write(
-            encoder.encode(
-              'data: {"error":true,"message":"Response timeout"}\n\n',
-            ),
-          );
-          await writer.write(encoder.encode("data: [DONE]\n\n"));
-          await writer.close();
-        } catch {
-          // writer closed
-        }
-      }, 60000);
-
-      handleStream(reader, writer, "", timeout).catch(async (error) => {
-        clearTimeout(timeout);
-        try {
-          await writer.write(
-            encoder.encode(
-              `data: {"error":true,"message":"${error.message}"}\n\n`,
-            ),
-          );
-          await writer.write(encoder.encode("data: [DONE]\n\n"));
-          await writer.close();
-        } catch {
-          // writer closed
-        }
-      });
-
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
-    }
-
-    const responseText = await qwenResponse.text();
-    return new Response(responseText, {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
-    });
+    return response;
   } catch (error) {
-    return new Response(
-      JSON.stringify({ error: true, message: error.message }),
-      { status: 500 },
-    );
+    console.error("Error forwarding request:", error);
+    return new Response(JSON.stringify({ error: "Internal Server Error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 }
 
-Deno.serve(handleRequest);
+console.log("Server starting on port 80...");
+await serve(handleRequest, { port: 80 });
