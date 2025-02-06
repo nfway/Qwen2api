@@ -1,5 +1,3 @@
-
-
 import { serve } from "https://deno.land/std/http/server.ts";
 
 const QWEN_BASE_URL = "https://chat.qwenlm.ai";
@@ -52,60 +50,42 @@ function getIncrementalContent(previous: string, current: string): string {
  * 处理流式响应的核心函数
  */
 async function streamResponse(response: Response) {
-  // 获取响应体的读取器
   const reader = response.body!.getReader();
-  // 创建文本编码器和解码器
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   
-  // 用于存储未处理完的数据片段
   let buffer = "";
-  // 用于记录上一次的完整内容，用于计算增量
   let previousContent = "";
   
-  // 创建可读流
   const stream = new ReadableStream({
     async start(controller) {
       try {
         while (true) {
-          // 读取数据块
           const { done, value } = await reader.read();
           if (done) break;
           
-          // 将二进制数据解码为文本
           buffer += decoder.decode(value, { stream: true });
-          // 按换行符分割数据
-          const lines = buffer.split("\n");
-          // 保存最后一个可能不完整的行
+          let lines = buffer.split("\n");
           buffer = lines.pop() || "";
-          
+
           for (const line of lines) {
-            // 跳过空行
-            if (line.trim() === "") continue;
-            // 跳过非数据行
             if (!line.startsWith("data: ")) continue;
             
-            // 提取数据部分
             const data = line.slice(6);
-            // 处理流结束标记
             if (data === "[DONE]") {
               controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
               continue;
             }
-            
+
             try {
-              // 解析 JSON 数据
               const parsed = JSON.parse(data) as StreamResponse;
               const choice = parsed.choices[0];
               
               if (choice?.delta?.content) {
-                // 处理内容更新
                 const currentContent = choice.delta.content;
-                // 计算真正的增量内容
                 const incrementalContent = getIncrementalContent(previousContent, currentContent);
                 
                 if (incrementalContent) {
-                  // 构造新的输出对象，只包含增量内容
                   const newOutput: StreamResponse = {
                     ...parsed,
                     choices: [{
@@ -113,27 +93,23 @@ async function streamResponse(response: Response) {
                       delta: { content: incrementalContent }
                     }]
                   };
-                  // 将增量内容编码并发送
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify(newOutput)}\n\n`));
-                  // 更新前一次的内容
                   previousContent = currentContent;
                 }
               } else if (choice?.delta?.role) {
-                // 对于角色信息，直接转发不需要处理增量
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
               }
             } catch (e) {
-              console.error("Failed to parse JSON:", e);
+              console.error("Skipping invalid JSON:", line);
             }
           }
         }
-        
-        // 处理缓冲区中可能剩余的最后一块数据
-        if (buffer) {
+
+        // 处理剩余buffer（仅处理有效数据）
+        if (buffer.startsWith("data: ")) {
+          const data = buffer.slice(6);
           try {
-            const data = buffer.replace(/^data: /, "");
             if (data !== "[DONE]") {
-              // 解析并处理最后的数据块
               const parsed = JSON.parse(data) as StreamResponse;
               const choice = parsed.choices[0];
               
@@ -154,28 +130,27 @@ async function streamResponse(response: Response) {
               }
             }
           } catch (e) {
-            console.error("Failed to parse remaining buffer:", e);
+            console.error("Failed to parse remaining buffer:", buffer);
           }
         }
         
-        // 关闭控制器
         controller.close();
       } catch (e) {
-        // 发生错误时通知控制器
+        console.error("Stream error:", e);
         controller.error(e);
       }
     },
   });
 
-  // 返回新的流式响应，设置适当的响应头
   return new Response(stream, {
     headers: {
-      "Content-Type": "text/event-stream",  // 指定为服务器发送事件流
-      "Cache-Control": "no-cache",          // 禁用缓存
-      "Connection": "keep-alive",           // 保持连接
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
     },
   });
 }
+
 
 /**
  * 将base64图片上传到API
